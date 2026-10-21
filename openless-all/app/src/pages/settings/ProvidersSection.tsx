@@ -1671,6 +1671,7 @@ function providerErrorMessage(error: unknown, t: ReturnType<typeof useTranslatio
     'llmResponseIncomplete',
     'llmStreamError',
     'llmProtocolHeaderConflict',
+    'llmThinkingRequired',
   ]) {
     if (message.includes(code)) return t(`settings.providers.${code}`);
   }

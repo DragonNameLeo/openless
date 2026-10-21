@@ -342,40 +342,46 @@ impl GeminiProvider {
             .map_err(llm_error_from_reqwest)
     }
 
-    async fn post_unary_once(
+    /// Whether a 400 came from the thinking-off config: Gemini rejects it
+    /// with the generic "Request contains an invalid argument."
+    /// (gemini-3.5-flash-lite), so only re-sending the request without
+    /// `thinkingConfig` tells it apart from other bad arguments.
+    async fn rejects_thinking_off(
         &self,
         url: &str,
+        status: reqwest::StatusCode,
         body: &Value,
-    ) -> Result<(reqwest::StatusCode, String), LLMError> {
-        let response = self.post(url, body, false).await?;
-        let status = response.status();
-        let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
-        Ok((status, body_text))
-    }
-
-    fn log_thinking_fallback(&self) {
-        log::warn!(
-            "[llm] gemini model={} rejected the thinking-off config; retrying with the model's default thinking",
-            self.config.model
-        );
+        sse: bool,
+    ) -> bool {
+        let Some(probe_body) = body_without_thinking_config(status, body) else {
+            return false;
+        };
+        let rejected = self
+            .post(url, &probe_body, sse)
+            .await
+            .is_ok_and(|probe| probe.status().is_success());
+        if rejected {
+            log::warn!(
+                "[llm] gemini model={} rejects thinking turned off; the channel needs thinking on",
+                self.config.model
+            );
+        }
+        rejected
     }
 
     async fn send_unary(&self, url: &str, body: &Value) -> Result<String, LLMError> {
-        let (status, body_text) = self.post_unary_once(url, body).await?;
-        let (status, body_text) =
-            match body_without_rejected_thinking_config(status, &body_text, body) {
-                Some(retry_body) => {
-                    self.log_thinking_fallback();
-                    self.post_unary_once(url, &retry_body).await?
-                }
-                None => (status, body_text),
-            };
+        let response = self.post(url, body, false).await?;
+        let status = response.status();
+        let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
 
         let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
         let preview = safe_str_slice(&body_text, preview_end);
         log::info!("[llm] HTTP {} body={}", status.as_u16(), preview);
 
         if !status.is_success() {
+            if self.rejects_thinking_off(url, status, body, false).await {
+                return Err(thinking_required_error());
+            }
             return Err(LLMError::InvalidResponse {
                 status: status.as_u16(),
                 body: preview.to_string(),
@@ -397,21 +403,14 @@ impl GeminiProvider {
         C: Fn() -> bool + Send + Sync,
     {
         let mut response = self.post(url, body, true).await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
-            let Some(retry_body) = body_without_rejected_thinking_config(status, &body_text, body)
-            else {
-                return Err(http_failure(status, &body_text));
-            };
-            self.log_thinking_fallback();
-            response = self.post(url, &retry_body, true).await?;
-        }
-
         let status = response.status();
         if !status.is_success() {
             let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
-            return Err(http_failure(status, &body_text));
+            let error = http_failure(status, &body_text);
+            if self.rejects_thinking_off(url, status, body, true).await {
+                return Err(thinking_required_error());
+            }
+            return Err(error);
         }
 
         // Byte-level buffering — `reqwest::chunk()` may split in the middle
@@ -621,31 +620,34 @@ fn qa_messages_to_contents(messages: &[QaChatMessage]) -> Vec<Value> {
 /// no thinkingConfig is sent; when disabled, it sends the official
 /// `thinkingBudget = 0` that expresses "no thinking". A model that rejects
 /// it (Gemini 3+ models only take `thinkingLevel`, some can't stop thinking)
-/// is retried once without it — see `body_without_rejected_thinking_config`.
+/// fails with `llmThinkingRequired`, which asks the user to turn thinking
+/// on — see `GeminiProvider::rejects_thinking_off`.
 fn disabled_thinking_config() -> Value {
     json!({ "thinkingBudget": 0 })
 }
 
-/// Retry body for a 400 that blames the thinking config: the same request
-/// with `thinkingConfig` dropped, so the model falls back to its own default
-/// thinking instead of failing the call. `None` when the failure is anything
-/// else or the request carried no thinkingConfig.
-fn body_without_rejected_thinking_config(
+/// The same request with `thinkingConfig` dropped, to probe a 400. `None`
+/// when the failure is anything else or the request carried no
+/// thinkingConfig.
+fn body_without_thinking_config(
     status: reqwest::StatusCode,
-    response_body: &str,
     request_body: &Value,
 ) -> Option<Value> {
-    if status != reqwest::StatusCode::BAD_REQUEST
-        || !response_body.to_ascii_lowercase().contains("thinking")
-    {
+    if status != reqwest::StatusCode::BAD_REQUEST {
         return None;
     }
     request_body["generationConfig"].get("thinkingConfig")?;
-    let mut retry_body = request_body.clone();
-    retry_body["generationConfig"]
+    let mut probe_body = request_body.clone();
+    probe_body["generationConfig"]
         .as_object_mut()?
         .remove("thinkingConfig");
-    Some(retry_body)
+    Some(probe_body)
+}
+
+/// Shown by the provider settings as "turn thinking on"
+/// (`settings.providers.llmThinkingRequired`).
+fn thinking_required_error() -> LLMError {
+    LLMError::ParseError("llmThinkingRequired".to_string())
 }
 
 /// Base path with the API version defaulted like model listing and Gemini
@@ -785,55 +787,151 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejected_thinking_config_is_retried_without_it() {
-        let cfg = GeminiConfig::new("k", "gemini-3.8-flash", "https://x/v1beta");
-        let body = GeminiProvider::new(cfg).build_generate_body("SYS", vec![user_content("hi")]);
-        let rejection = r#"{"error":{"code":400,"message":"Budget 0 is invalid. This model only works in thinking mode.","status":"INVALID_ARGUMENT"}}"#;
+    const GENERIC_INVALID_ARGUMENT: &str = r#"{"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}}"#;
 
-        let retry = body_without_rejected_thinking_config(
-            reqwest::StatusCode::BAD_REQUEST,
-            rejection,
-            &body,
-        )
-        .expect("thinking rejection should be retried");
-        assert!(retry["generationConfig"].get("thinkingConfig").is_none());
-        assert_eq!(
-            retry["generationConfig"]["temperature"],
-            body["generationConfig"]["temperature"]
-        );
-        assert_eq!(retry["contents"], body["contents"]);
-        assert_eq!(retry["systemInstruction"], body["systemInstruction"]);
+    /// Answers each request on its own connection: Gemini's generic 400 when
+    /// `reject(body)` holds, else a one-word reply. Returns the base URL and
+    /// the request bodies seen so far.
+    async fn gemini_server(
+        reject: fn(&str) -> bool,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1beta", listener.local_addr().unwrap());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&bodies);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let body = loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0, "request ended before body");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let header = String::from_utf8_lossy(&request[..index]).to_ascii_lowercase();
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= index + 4 + length {
+                        break String::from_utf8_lossy(&request[index + 4..index + 4 + length])
+                            .into_owned();
+                    }
+                };
+                let (status, reply) = if reject(&body) {
+                    ("400 Bad Request", GENERIC_INVALID_ARGUMENT)
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#,
+                    )
+                };
+                seen.lock().unwrap().push(body);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (base_url, bodies)
+    }
+
+    fn provider_for(base_url: &str, thinking_enabled: bool) -> GeminiProvider {
+        // Do not inherit machine-specific proxy settings or the global cache.
+        GeminiProvider {
+            config: GeminiConfig::new("k", "gemini-3.5-flash-lite", base_url)
+                .with_thinking_enabled(thinking_enabled),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        }
+    }
+
+    fn is_thinking_required<T>(result: &Result<T, LLMError>) -> bool {
+        matches!(result, Err(LLMError::ParseError(code)) if code == "llmThinkingRequired")
+    }
+
+    #[tokio::test]
+    async fn rejected_thinking_off_asks_to_turn_thinking_on() {
+        // gemini-3.5-flash-lite answers thinkingBudget 0 with the generic
+        // INVALID_ARGUMENT and accepts the request without thinkingConfig.
+        let (base_url, bodies) = gemini_server(|body| body.contains("thinkingConfig")).await;
+        let provider = provider_for(&base_url, false);
+        let body = provider.build_generate_body("SYS", vec![user_content("hi")]);
+
+        let unary = provider
+            .send_unary(&generate_content_url(&base_url, "m"), &body)
+            .await;
+        assert!(is_thinking_required(&unary));
+        let streaming = provider
+            .send_streaming(
+                &stream_generate_content_url(&base_url, "m"),
+                &body,
+                |_| {},
+                || false,
+            )
+            .await;
+        assert!(is_thinking_required(&streaming));
+
+        // Each call: the rejected request, then one probe without thinkingConfig.
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        assert!(!bodies[1].contains("thinkingConfig"));
+        assert!(!bodies[3].contains("thinkingConfig"));
+    }
+
+    #[tokio::test]
+    async fn other_invalid_arguments_keep_the_http_error() {
+        let (base_url, bodies) = gemini_server(|_| true).await;
+        let url = generate_content_url(&base_url, "m");
+
+        // The probe fails too, so thinking is not the cause.
+        let provider = provider_for(&base_url, false);
+        let body = provider.build_generate_body("SYS", vec![user_content("hi")]);
+        let result = provider.send_unary(&url, &body).await;
+        assert!(matches!(
+            result,
+            Err(LLMError::InvalidResponse { status: 400, .. })
+        ));
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+
+        // Thinking on sends no thinkingConfig, so there is nothing to probe.
+        let provider = provider_for(&base_url, true);
+        let body = provider.build_generate_body("SYS", vec![user_content("hi")]);
+        let result = provider.send_unary(&url, &body).await;
+        assert!(matches!(
+            result,
+            Err(LLMError::InvalidResponse { status: 400, .. })
+        ));
+        assert_eq!(bodies.lock().unwrap().len(), 3);
     }
 
     #[test]
-    fn unrelated_failures_are_not_retried() {
+    fn only_a_400_with_thinking_config_is_probed() {
         let cfg = GeminiConfig::new("k", "gemini-3.8-flash", "https://x/v1beta");
         let body = GeminiProvider::new(cfg).build_generate_body("SYS", vec![user_content("hi")]);
-        assert!(body_without_rejected_thinking_config(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"code":400,"message":"API key not valid."}}"#,
-            &body,
-        )
-        .is_none());
-        assert!(body_without_rejected_thinking_config(
-            reqwest::StatusCode::NOT_FOUND,
-            r#"{"error":{"message":"thinking model not found"}}"#,
-            &body,
-        )
-        .is_none());
 
-        let thinking_on = GeminiProvider::new(
-            GeminiConfig::new("k", "gemini-3.8-flash", "https://x/v1beta")
-                .with_thinking_enabled(true),
-        )
-        .build_generate_body("SYS", vec![user_content("hi")]);
-        assert!(body_without_rejected_thinking_config(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"thinking is not supported"}}"#,
-            &thinking_on,
-        )
-        .is_none());
+        let probe = body_without_thinking_config(reqwest::StatusCode::BAD_REQUEST, &body)
+            .expect("a 400 on the thinking-off request should be probed");
+        assert!(probe["generationConfig"].get("thinkingConfig").is_none());
+        assert_eq!(
+            probe["generationConfig"]["temperature"],
+            body["generationConfig"]["temperature"]
+        );
+        assert_eq!(probe["contents"], body["contents"]);
+        assert_eq!(probe["systemInstruction"], body["systemInstruction"]);
+
+        assert!(body_without_thinking_config(reqwest::StatusCode::NOT_FOUND, &body).is_none());
+        assert!(
+            body_without_thinking_config(reqwest::StatusCode::TOO_MANY_REQUESTS, &body).is_none()
+        );
     }
 
     #[test]
