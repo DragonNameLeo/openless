@@ -319,23 +319,57 @@ impl GeminiProvider {
         })
     }
 
-    async fn send_unary(&self, url: &str, body: &Value) -> Result<String, LLMError> {
+    async fn post(
+        &self,
+        url: &str,
+        body: &Value,
+        sse: bool,
+    ) -> Result<reqwest::Response, LLMError> {
         let mut request = self
             .client
             .post(url)
             .header("Content-Type", "application/json");
+        if sse {
+            request = request.header("Accept", "text/event-stream");
+        }
         if !self.config.api_key.trim().is_empty() {
             request = request.header("x-goog-api-key", self.config.api_key.as_str());
         }
-        let request = request.json(body);
+        request
+            .json(body)
+            .send()
+            .await
+            .map_err(llm_error_from_reqwest)
+    }
 
-        let response = match request.send().await {
-            Ok(r) => r,
-            Err(e) => return Err(llm_error_from_reqwest(e)),
-        };
-
+    async fn post_unary_once(
+        &self,
+        url: &str,
+        body: &Value,
+    ) -> Result<(reqwest::StatusCode, String), LLMError> {
+        let response = self.post(url, body, false).await?;
         let status = response.status();
         let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
+        Ok((status, body_text))
+    }
+
+    fn log_thinking_fallback(&self) {
+        log::warn!(
+            "[llm] gemini model={} rejected the thinking-off config; retrying with the model's default thinking",
+            self.config.model
+        );
+    }
+
+    async fn send_unary(&self, url: &str, body: &Value) -> Result<String, LLMError> {
+        let (status, body_text) = self.post_unary_once(url, body).await?;
+        let (status, body_text) =
+            match body_without_rejected_thinking_config(status, &body_text, body) {
+                Some(retry_body) => {
+                    self.log_thinking_fallback();
+                    self.post_unary_once(url, &retry_body).await?
+                }
+                None => (status, body_text),
+            };
 
         let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
         let preview = safe_str_slice(&body_text, preview_end);
@@ -362,34 +396,24 @@ impl GeminiProvider {
         F: Fn(&str) + Send + Sync,
         C: Fn() -> bool + Send + Sync,
     {
-        let mut request = self
-            .client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-        if !self.config.api_key.trim().is_empty() {
-            request = request.header("x-goog-api-key", self.config.api_key.as_str());
+        let mut response = self.post(url, body, true).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
+            let Some(retry_body) = body_without_rejected_thinking_config(status, &body_text, body)
+            else {
+                return Err(http_failure(status, &body_text));
+            };
+            self.log_thinking_fallback();
+            response = self.post(url, &retry_body, true).await?;
         }
-        let request = request.json(body);
-
-        let response = match request.send().await {
-            Ok(r) => r,
-            Err(e) => return Err(llm_error_from_reqwest(e)),
-        };
 
         let status = response.status();
         if !status.is_success() {
             let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
-            let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
-            let preview = safe_str_slice(&body_text, preview_end);
-            log::error!("[llm] HTTP {} body={}", status.as_u16(), preview);
-            return Err(LLMError::InvalidResponse {
-                status: status.as_u16(),
-                body: preview.to_string(),
-            });
+            return Err(http_failure(status, &body_text));
         }
 
-        let mut response = response;
         // Byte-level buffering — `reqwest::chunk()` may split in the middle
         // of a multi-byte UTF-8 character (CJK / emoji); calling from_utf8 on
         // each chunk independently would treat a valid SSE stream as
@@ -464,6 +488,16 @@ impl GeminiProvider {
 }
 
 // ─────────────────────── internal helpers ───────────────────────
+
+fn http_failure(status: reqwest::StatusCode, body_text: &str) -> LLMError {
+    let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
+    let preview = safe_str_slice(body_text, preview_end);
+    log::error!("[llm] HTTP {} body={}", status.as_u16(), preview);
+    LLMError::InvalidResponse {
+        status: status.as_u16(),
+        body: preview.to_string(),
+    }
+}
 
 fn user_content(text: &str) -> Value {
     json!({ "role": "user", "parts": [{ "text": text }] })
@@ -585,11 +619,46 @@ fn qa_messages_to_contents(messages: &[QaChatMessage]) -> Vec<Value> {
 ///
 /// OpenLess keeps no per-model adaptation table: when thinking is enabled,
 /// no thinkingConfig is sent; when disabled, it sends the official
-/// `thinkingBudget = 0` that expresses "no thinking". If a specific model
-/// doesn't support the field or can't fully disable thinking, the Gemini API
-/// itself handles that.
+/// `thinkingBudget = 0` that expresses "no thinking". A model that rejects
+/// it (Gemini 3+ models only take `thinkingLevel`, some can't stop thinking)
+/// is retried once without it — see `body_without_rejected_thinking_config`.
 fn disabled_thinking_config() -> Value {
     json!({ "thinkingBudget": 0 })
+}
+
+/// Retry body for a 400 that blames the thinking config: the same request
+/// with `thinkingConfig` dropped, so the model falls back to its own default
+/// thinking instead of failing the call. `None` when the failure is anything
+/// else or the request carried no thinkingConfig.
+fn body_without_rejected_thinking_config(
+    status: reqwest::StatusCode,
+    response_body: &str,
+    request_body: &Value,
+) -> Option<Value> {
+    if status != reqwest::StatusCode::BAD_REQUEST
+        || !response_body.to_ascii_lowercase().contains("thinking")
+    {
+        return None;
+    }
+    request_body["generationConfig"].get("thinkingConfig")?;
+    let mut retry_body = request_body.clone();
+    retry_body["generationConfig"]
+        .as_object_mut()?
+        .remove("thinkingConfig");
+    Some(retry_body)
+}
+
+/// Base path with the API version defaulted like model listing and Gemini
+/// ASR (`asr::gemini::endpoint_url`): a bare
+/// `https://generativelanguage.googleapis.com` would otherwise POST to
+/// `/models/...` and 404.
+fn api_base_path(url: &reqwest::Url) -> String {
+    let path = url.path().trim_end_matches('/');
+    if path.is_empty() {
+        "/v1beta".to_owned()
+    } else {
+        path.to_owned()
+    }
 }
 
 fn generate_content_url(base_url: &str, model: &str) -> String {
@@ -598,7 +667,7 @@ fn generate_content_url(base_url: &str, model: &str) -> String {
         let fallback = trimmed.trim_end_matches('/');
         return format!("{fallback}/models/{model}:generateContent");
     };
-    let path = url.path().trim_end_matches('/');
+    let path = api_base_path(&url);
     url.set_path(&format!("{path}/models/{model}:generateContent"));
     url.to_string()
 }
@@ -609,7 +678,7 @@ fn stream_generate_content_url(base_url: &str, model: &str) -> String {
         let fallback = trimmed.trim_end_matches('/');
         return format!("{fallback}/models/{model}:streamGenerateContent?alt=sse");
     };
-    let path = url.path().trim_end_matches('/');
+    let path = api_base_path(&url);
     url.set_path(&format!("{path}/models/{model}:streamGenerateContent"));
     let existing_query = url
         .query_pairs()
@@ -691,6 +760,80 @@ mod tests {
             ),
             "https://example.com/v1beta/models/gemini-2.5-flash:generateContent?token=query-secret#client-fragment"
         );
+    }
+
+    #[test]
+    fn content_urls_default_bare_host_to_v1beta() {
+        // Model listing and Gemini ASR already default a bare host to
+        // /v1beta; the LLM call must too, or validation 404s.
+        for base in [
+            "https://generativelanguage.googleapis.com",
+            "https://generativelanguage.googleapis.com/",
+        ] {
+            assert_eq!(
+                generate_content_url(base, "gemini-3.5-flash-lite"),
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"
+            );
+            assert_eq!(
+                stream_generate_content_url(base, "gemini-3.5-flash-lite"),
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:streamGenerateContent?alt=sse"
+            );
+        }
+        assert_eq!(
+            generate_content_url("https://proxy.example/v1", "m"),
+            "https://proxy.example/v1/models/m:generateContent"
+        );
+    }
+
+    #[test]
+    fn rejected_thinking_config_is_retried_without_it() {
+        let cfg = GeminiConfig::new("k", "gemini-3.8-flash", "https://x/v1beta");
+        let body = GeminiProvider::new(cfg).build_generate_body("SYS", vec![user_content("hi")]);
+        let rejection = r#"{"error":{"code":400,"message":"Budget 0 is invalid. This model only works in thinking mode.","status":"INVALID_ARGUMENT"}}"#;
+
+        let retry = body_without_rejected_thinking_config(
+            reqwest::StatusCode::BAD_REQUEST,
+            rejection,
+            &body,
+        )
+        .expect("thinking rejection should be retried");
+        assert!(retry["generationConfig"].get("thinkingConfig").is_none());
+        assert_eq!(
+            retry["generationConfig"]["temperature"],
+            body["generationConfig"]["temperature"]
+        );
+        assert_eq!(retry["contents"], body["contents"]);
+        assert_eq!(retry["systemInstruction"], body["systemInstruction"]);
+    }
+
+    #[test]
+    fn unrelated_failures_are_not_retried() {
+        let cfg = GeminiConfig::new("k", "gemini-3.8-flash", "https://x/v1beta");
+        let body = GeminiProvider::new(cfg).build_generate_body("SYS", vec![user_content("hi")]);
+        assert!(body_without_rejected_thinking_config(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":400,"message":"API key not valid."}}"#,
+            &body,
+        )
+        .is_none());
+        assert!(body_without_rejected_thinking_config(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"thinking model not found"}}"#,
+            &body,
+        )
+        .is_none());
+
+        let thinking_on = GeminiProvider::new(
+            GeminiConfig::new("k", "gemini-3.8-flash", "https://x/v1beta")
+                .with_thinking_enabled(true),
+        )
+        .build_generate_body("SYS", vec![user_content("hi")]);
+        assert!(body_without_rejected_thinking_config(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"thinking is not supported"}}"#,
+            &thinking_on,
+        )
+        .is_none());
     }
 
     #[test]
