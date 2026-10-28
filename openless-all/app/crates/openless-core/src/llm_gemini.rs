@@ -407,7 +407,21 @@ impl GeminiProvider {
         if !status.is_success() {
             let body_text = response.text().await.map_err(llm_error_from_reqwest)?;
             let error = http_failure(status, &body_text);
-            if self.rejects_thinking_off(url, status, body, true).await {
+            if should_cancel() {
+                return Err(LLMError::Network("cancelled".into()));
+            }
+            // Match the shared streaming client's cancellation while waiting on network data.
+            let cancellation = async {
+                while !should_cancel() {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            };
+            let thinking_required = tokio::select! {
+                biased;
+                _ = cancellation => return Err(LLMError::Network("cancelled".into())),
+                rejected = self.rejects_thinking_off(url, status, body, true) => rejected,
+            };
+            if thinking_required {
                 return Err(thinking_required_error());
             }
             return Err(error);
@@ -794,6 +808,7 @@ mod tests {
     /// the request bodies seen so far.
     async fn gemini_server(
         reject: fn(&str) -> bool,
+        probe_delay: Duration,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -835,6 +850,9 @@ mod tests {
                     )
                 };
                 seen.lock().unwrap().push(body);
+                if status == "200 OK" {
+                    tokio::time::sleep(probe_delay).await;
+                }
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
                     reply.len()
@@ -862,7 +880,8 @@ mod tests {
     async fn rejected_thinking_off_asks_to_turn_thinking_on() {
         // gemini-3.5-flash-lite answers thinkingBudget 0 with the generic
         // INVALID_ARGUMENT and accepts the request without thinkingConfig.
-        let (base_url, bodies) = gemini_server(|body| body.contains("thinkingConfig")).await;
+        let (base_url, bodies) =
+            gemini_server(|body| body.contains("thinkingConfig"), Duration::ZERO).await;
         let provider = provider_for(&base_url, false);
         let body = provider.build_generate_body("SYS", vec![user_content("hi")]);
 
@@ -889,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_invalid_arguments_keep_the_http_error() {
-        let (base_url, bodies) = gemini_server(|_| true).await;
+        let (base_url, bodies) = gemini_server(|_| true, Duration::ZERO).await;
         let url = generate_content_url(&base_url, "m");
 
         // The probe fails too, so thinking is not the cause.
@@ -911,6 +930,61 @@ mod tests {
             Err(LLMError::InvalidResponse { status: 400, .. })
         ));
         assert_eq!(bodies.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_does_not_probe_thinking_config() {
+        let (base_url, bodies) = gemini_server(|_| true, Duration::ZERO).await;
+        let provider = provider_for(&base_url, false);
+        let body = provider.build_generate_body("SYS", vec![user_content("hi")]);
+        let result = provider
+            .send_streaming(
+                &stream_generate_content_url(&base_url, "m"),
+                &body,
+                |_| panic!("cancelled request emitted text"),
+                || !bodies.lock().unwrap().is_empty(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(LLMError::Network(ref message)) if message == "cancelled")
+        );
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_interrupts_a_pending_thinking_probe() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (base_url, bodies) = gemini_server(
+            |body| body.contains("thinkingConfig"),
+            Duration::from_secs(10),
+        )
+        .await;
+        let provider = provider_for(&base_url, false);
+        let body = provider.build_generate_body("SYS", vec![user_content("hi")]);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::clone(&cancelled);
+        let seen = std::sync::Arc::clone(&bodies);
+        tokio::spawn(async move {
+            while seen.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.store(true, Ordering::Release);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.send_streaming(
+                &stream_generate_content_url(&base_url, "m"),
+                &body,
+                |_| panic!("cancelled request emitted text"),
+                || cancelled.load(Ordering::Acquire),
+            ),
+        )
+        .await
+        .expect("cancellation must not wait for the probe response");
+        assert!(
+            matches!(result, Err(LLMError::Network(ref message)) if message == "cancelled")
+        );
+        assert_eq!(bodies.lock().unwrap().len(), 2);
     }
 
     #[test]

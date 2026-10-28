@@ -2251,6 +2251,21 @@ export function OmniChannelSection() {
             placeholder={omniPreset?.modelPlaceholder || 'model-name'}
             onValueChange={setOmniModel}
             mono
+            trailing={
+              committedOmniProvider === 'gemini' && !geminiTranscribe ? (
+                <LlmThinkingToggle
+                  enabled={prefs?.llmThinkingEnabled ?? false}
+                  onToggle={(enabled) => {
+                    void updatePrefs((current) => ({
+                      ...current,
+                      llmThinkingEnabled: enabled,
+                    })).catch((error) =>
+                      console.error('[settings] failed to update Omni thinking mode', error),
+                    );
+                  }}
+                />
+              ) : undefined
+            }
           />
         </div>
         {committedOmniProvider === 'gemini' && (
