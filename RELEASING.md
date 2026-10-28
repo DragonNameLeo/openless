@@ -7,7 +7,7 @@ day-to-day development.
 
 **Only repository administrators may create version tags and publish releases.**
 
-- Only an admin may create a release tag (`v*-tauri`) or publish a GitHub Release. Linux assets require a separate accepted build and explicit administrator upload.
+- Only an admin may create a release tag (`v*-tauri`) or publish a GitHub Release. Linux assets ride the same tag, but the L01-L12 device acceptance must be finished *before* the tag is cut.
 - Contributors (including AI agents) **must not** create release tags, publish
   releases, or trigger release automation. If a release is needed, **request an admin
   to cut it** — open an issue or ping a maintainer with the target version and the
@@ -43,18 +43,34 @@ component, which is a 16-bit field. The full version still appears in the app an
 updater manifest; NSIS uses its supported numeric fallback for file metadata.
 See [the pinned NSIS bundler](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.10.1/crates/tauri-bundler/src/bundle/windows/nsis/mod.rs#L149).
 
-These tags build the macOS, Windows, and Android Tauri hosts in parallel. Linux is
-triggered separately so an unaccepted package can never ride along with a desktop
-release: `.github/workflows/release-linux-egui.yml` is manual-only, requires the
-release tag as an input, checks it out, runs the same Core/host/deb/rpm
-verification as CI, and then **attaches the verified packages to that same
-Release automatically**. Nothing is uploaded by hand. Linux has no in-app updater
-manifest or AppImage.
+These tags build the macOS, Windows, and Android Tauri hosts in parallel.
 
-HarmonyOS rides in the same Release through `.github/workflows/release-harmony.yml`.
-It is manual-only as well and requires the same tag. It builds, signs and attaches
-`OpenLess_harmony_arm64.hap` plus the `OpenLess_harmony.hap` alias, then uploads
-the same HAP to HUAWEI AppGallery Connect.
+Linux and HarmonyOS ride in the same Release through two dispatch-only entry
+points, `.github/workflows/release-linux-egui.yml` and
+`.github/workflows/release-harmony.yml`. Neither reacts to a `push:` event, so an
+arbitrary commit can never rebuild a package; `release-tauri.yml` dispatches both
+through `dispatch-platform-releases` as soon as the desktop/Android assets of a
+`v*-tauri` tag are published. That dispatch is what makes a tag push ship a
+complete Release: the two workflows only wait ten minutes for the Release to
+exist, less than the desktop matrix needs, which is why they cannot be triggered
+by the tag itself. To rebuild one platform for an already-published tag, dispatch
+it by hand on the same tag - that stays the repair path.
+
+Linux runs the same Core/host/deb/rpm verification as CI and **attaches the
+verified packages to that Release automatically**; nothing is uploaded by hand,
+and there is no in-app updater manifest or AppImage. Because the tag now ships
+Linux unattended, the device acceptance in
+[docs/linux-egui-handoff/07-acceptance.md](docs/linux-egui-handoff/07-acceptance.md)
+is a **pre-tag** gate rather than a post-build one.
+
+HarmonyOS builds, signs and attaches `OpenLess_harmony_arm64.hap` plus the
+`OpenLess_harmony.hap` alias, and can upload the signed package (App Pack) to
+HUAWEI AppGallery Connect. The automatic dispatch uses `channel: none`, the
+repository path: the HAP is attached to the GitHub Release unsigned and nothing
+reaches the store. Set the repository variable `HARMONY_AUTO_CHANNEL` to
+`release` (production) or `test` (test channel) to have the signed package
+uploaded as the AGC candidate package automatically; the upload never submits it
+for review, so store submission remains a human decision either way.
 
 The build needs the official HarmonyOS command-line tools (SDK + hvigor + ohpm +
 bundled node). Huawei's download page wants an account, but the same archive is
@@ -79,11 +95,18 @@ redistribution, which is also why it is fetched at job time rather than vendored
 | AppGallery 正式版 | `OpenLess_harmony_arm64-signed.hap` | `release.*` material | AppGallery only, never a Release asset |
 | 测试渠道 | `OpenLess_harmony_arm64-signed.hap` | `test.*` material | AppGallery test channel |
 
-Dispatch the workflow with `channel: release` (default) or `channel: test`; the
-input selects both the signing prefix (`release.cer/p7b/p12` vs
-`test.cer/p7b/p12`) and the AppGallery upload label. The workflow artifact
-bundle carries both packages, the Release step uploads only the unsigned pair,
-and the AppGallery step uploads only the signed one.
+Dispatch the workflow with `channel: none` (default), `channel: release` or
+`channel: test`:
+
+- `none` is the repository path. It builds the HAP, attaches the **unsigned**
+  package to the GitHub Release and touches neither the signing step nor the
+  store, so it needs no secret at all.
+- `release` / `test` select the signing prefix (`release.cer/p7b/p12` vs
+  `test.cer/p7b/p12`), sign, and upload to AppGallery.
+
+The workflow artifact bundle carries both packages; the Release step uploads only
+the unsigned pair, and the AppGallery step uploads only the signed one. CI never
+signs: `ci.yml` always builds with `OPENLESS_HARMONY_CHANNEL=none`.
 
 A local machine without store certificates can still produce a package:
 `OPENLESS_HARMONY_CHANNEL=none` builds and ships the unsigned HAP only, and
@@ -142,9 +165,34 @@ The script takes a plain `X.Y.Z`; for a prerelease version such as
 4. The applicable [desktop feature and device acceptance](docs/2.0-desktop-acceptance.md), signing, and distribution requirements are met; green builds alone do not establish product readiness. Linux acceptance below is required before including Linux assets.
 5. Then, and only then, push the release tag.
 6. Both Beta and Stable tag workflows upload Tauri and Android assets to a shared
-   draft. Wait for **both** workflows to succeed, verify the packages and channel
-   updater manifests, then publish that draft (Beta as a prerelease; Stable as latest).
+   draft. Wait for **both** workflows to succeed, verify the packages, then publish that
+   draft (Beta as a prerelease; Stable as latest).
    Do not rerun an asset workflow after publication without first returning the release to draft.
+
+   The workflows also write the channel updater manifests (`latest-{target}-{arch}.json` and
+   `latest-{target}-{arch}-beta.json`) but deliberately keep them **out** of the release assets —
+   current clients read the CDN, not the release. Download them from the run and publish them to
+   the CDN as part of publishing the release:
+
+   | platform | workflow artifact |
+   | --- | --- |
+   | macOS | `openless-macos-<arch>-updater` |
+   | Windows | `openless-windows-x64-updater` |
+   | Android | `openless-android-updater-manifests` |
+
+   Destination (overwrite in place; the file name is per platform and channel, never per
+   version):
+
+   ```text
+   https://dl.aeoform.com/updates/stable/latest-{target}-{arch}.json
+   https://dl.aeoform.com/updates/beta/latest-{target}-{arch}-beta.json
+   ```
+
+   Their `url` fields must point at the CDN artifacts (`.../releases/{tag}/{asset}`).
+   Manifest upload is the step that makes a release reachable by auto-update: a published
+   release whose manifests were not synced is downloadable by hand but invisible to the updater.
+   Clients built before the CDN switch read the old `releases/latest/download/latest-*.json`
+   assets, which new releases no longer carry, so they need one manual download.
 7. Publishing Stable with the administrator's CLI/UI credential automatically
    triggers `sync-homebrew-cask.yml`. It accepts only the published latest Stable
    tag, preserves application build metadata in DMG filenames, verifies matching
@@ -167,6 +215,69 @@ Before dispatching the Linux release build, additionally require all of the foll
 The HAP build reads everything from the environment; no key material is ever
 committed, cached or printed.
 
+### Where each piece comes from
+
+Everything below is done once, on a machine you trust, with your own HUAWEI
+developer account. Nothing here can be automated: AppGallery issues the material
+only to a verified developer, and it will not accept a self-signed substitute.
+
+| Step | Where | What you get |
+|---|---|---|
+| 1 | <https://developer.huawei.com> → 注册 + 实名认证（个人或企业） | an account that may create certificates |
+| 2 | AppGallery Connect → 我的项目 → 创建项目 → 添加应用（HarmonyOS，包名必须是 `openless.hm.com`，与 `harmony/AppScope/app.json5` 一致） | `APPGALLERY_APP_ID`（应用信息里的 APP ID） |
+| 3 | 本地：生成密钥库与证书请求 | `release.p12` + `release.csr` + 两个密码 |
+| 4 | AGC → 用户与访问 → 证书管理 → 申请证书（**发布证书**）→ 上传 `release.csr` | `release.cer` |
+| 5 | AGC → Profile 管理 → 申请 Profile（**发布 Profile**，绑定上面的证书与包名） | `release.p7b` |
+| 6 | AGC → 用户与访问 → API 密钥 → 创建客户端（勾选发布相关权限） | `APPGALLERY_CLIENT_ID` / `APPGALLERY_CLIENT_SECRET` |
+
+Step 3, without DevEco Studio:
+
+```bash
+keytool -genkeypair -keystore release.p12 -storetype PKCS12 \
+  -alias harmony-release -keyalg EC -groupname secp256r1 \
+  -sigalg SHA256withECDSA -validity 9125 \
+  -dname "CN=OpenLess, O=<你的组织>, C=CN"
+keytool -certreq -keystore release.p12 -alias harmony-release -file release.csr
+```
+
+Keep `release.p12` and both passwords offline; they are the only copy of the
+private key that AppGallery will trust.
+
+Before uploading anything, dry-run the material:
+
+```bash
+bash openless-all/app/scripts/check-harmony-signing.sh \
+  ~/.local/share/harmony/signing/release release
+```
+
+It proves the four things that fail late otherwise: the certificate belongs to
+the keystore key, the profile was issued for that certificate, `bundle-info.bundle-name`
+equals `harmony/AppScope/app.json5`, and nothing has expired. The workflow runs the
+same check before it starts building.
+
+### Storing them in the repository
+
+```bash
+base64 -w0 release.cer       # → HARMONY_RELEASE_CERT_BASE64
+base64 -w0 release.p7b       # → HARMONY_RELEASE_PROFILE_BASE64
+base64 -w0 release.p12       # → HARMONY_RELEASE_KEYSTORE_BASE64
+```
+
+`HARMONY_<CHANNEL>_*` names let production and test material coexist. The
+channel-agnostic `HARMONY_CERT_BASE64` / `HARMONY_PROFILE_BASE64` /
+`HARMONY_KEYSTORE_BASE64` are still accepted and are used when no
+channel-specific secret is set.
+
+### What the workflow does, and what it cannot do
+
+Automated: build → sign → verify the signature → upload as the AppGallery
+*candidate* package → attach the **unsigned** HAP to the GitHub Release.
+
+Manual, always: AGC requires a human to fill in the store listing (icon,
+screenshots, privacy-policy URL, 软件著作权, 分类与年龄分级) and to press
+提交审核. `scripts/upload-appgallery.mjs` deliberately stops at replacing the
+candidate package.
+
 | Kind | Name | Purpose |
 |---|---|---|
 | Secret | `HARMONY_KEYSTORE_BASE64` | base64 of the release `.p12` keystore |
@@ -174,10 +285,11 @@ committed, cached or printed.
 | Secret | `HARMONY_PROFILE_BASE64` | base64 of the release `.p7b` provisioning profile |
 | Secret | `HARMONY_KEYSTORE_PASSWORD` | keystore password |
 | Secret | `HARMONY_KEY_PASSWORD` | key password (falls back to the keystore password) |
-| Variable | `HARMONY_KEY_ALIAS` | key alias inside the keystore |
-| Variable | `HARMONY_TOOLCHAIN` | absolute path of the DevEco / HarmonyOS SDK on a self-hosted runner |
+| Variable (optional) | `HARMONY_KEY_ALIAS` | key alias inside the keystore; defaults to `harmony-<channel>` |
+| Variable (optional) | `HARMONY_TOOLCHAIN` | absolute path of the DevEco / HarmonyOS SDK on a self-hosted runner |
 | Variable (optional) | `HARMONY_SDK_URL` | override the tools archive URL |
 | Variable (optional) | `HARMONY_SDK_SHA256` | SHA-256 of that archive |
+| Variable (optional) | `HARMONY_AUTO_CHANNEL` | `none` (default) / `release` / `test` - the channel the automatic tag-build dispatch runs with; `release` or `test` upload the signed App Pack to AppGallery as the candidate package (never submitted for review) |
 
 The `test` channel reads the same three Secrets (`HARMONY_KEYSTORE_BASE64`,
 `HARMONY_CERT_BASE64`, `HARMONY_PROFILE_BASE64`). Store the test profile there
@@ -186,6 +298,13 @@ time matches the channel being built.
 | Secret | `APPGALLERY_CLIENT_ID` | AppGallery Connect API client id |
 | Secret | `APPGALLERY_CLIENT_SECRET` | AppGallery Connect API client secret |
 | Secret | `APPGALLERY_APP_ID` | AppGallery Connect app id of the HarmonyOS app |
+
+Nothing else has to be configured: the build downloads the official command-line
+tools from the checksum-pinned mirror, so a hosted runner needs no variable, no
+self-hosted machine and no Huawei account. The signing directory is exported by
+the workflow itself (`$RUNNER_TEMP/harmony-signing`) and must not be redeclared as
+an `env:` key - YAML `env` outranks `$GITHUB_ENV`, so an empty placeholder would
+shadow it and the build would fall back to a directory that does not exist.
 
 The upload replaces the candidate package in AppGallery Connect; it never submits
 the app for review, because AGC requires a human submission. Without the
@@ -247,6 +366,6 @@ change the published channel. The same format applies to subsequent releases.
 2. For a Stable release, a maintainer merges `beta → main`.
 3. An **admin** bumps the Tauri version (five-location sync), verifies CI is green,
    and pushes the release tag, which triggers the macOS/Windows/Android asset
-   workflows and their channel-specific updater manifests.
+   workflows and their channel updater manifests.
 4. After both release workflows pass, an admin verifies and publishes the shared
    draft. Linux packages are attached independently only after Linux acceptance.

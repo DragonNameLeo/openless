@@ -1,9 +1,11 @@
+import { siwcEs as siwc } from './siwc';
 import type { zhCN } from './zh-CN';
 
 import { uiRefinementEn as uiRefinement } from './uiRefinement';
 import { experimentalAsrEn as experimentalAsr } from './experimentalAsr';
 
 export const es: typeof zhCN = {
+  siwc,
   experimentalAsr,
   uiRefinement,
   voiceEdit: {
@@ -317,6 +319,8 @@ export const es: typeof zhCN = {
     cancelled: 'Cancelado',
     error: 'Se ha producido un error',
     inserted: '{{count}} insertados',
+    translateTo: 'Traducir al',
+    translationChangeFailed: 'No se pudo cambiar el idioma. Vuelve a seleccionarlo.',
     translating: 'Traduciendo',
     selectionPolish: {
       polishing: 'Mejorando el texto…',
@@ -347,6 +351,12 @@ export const es: typeof zhCN = {
     cancel: 'Cancelar',
   },
   qa: {
+    activity: {
+      searchingWeb: 'Buscando en la Web',
+      readingWeb: 'Leyendo páginas web',
+      usingTool: 'Usando {{tool}}',
+      tool: 'herramienta',
+    },
     compact: {
       closeError: 'No se pudo cerrar. Inténtalo de nuevo.',
       sendError: 'No se pudo enviar. Tu texto se conserva. Inténtalo de nuevo.',
@@ -1216,8 +1226,22 @@ export const es: typeof zhCN = {
       fallbackDesc: 'Si la traducción falla, se inserta la transcripción original.',
     },
   },
+  askAnything: {
+    dictation: 'Dictar',
+    translation: 'Traducir',
+    question: 'Pregunta lo que quieras',
+    dictationHint: 'Habla para introducir texto',
+    translationHint: 'Elige el idioma durante la grabación',
+    questionHint: 'Selecciona texto o pregunta directamente',
+    description:
+      'Pulsa la combinación para preguntar y otra vez para enviar. La respuesta aparece en la parte inferior.',
+    auxiliaryKey: 'Tecla adicional para preguntar',
+    auxiliaryHint: 'Púlsala junto con {{key}}. Sigue los cambios de la tecla de grabación.',
+    selectionHint:
+      'El texto seleccionado sirve de contexto. La selección es opcional. Cada combinación inicia una pregunta nueva.',
+  },
   selectionAsk: {
-    title: 'Preguntar sobre una selección',
+    title: 'Pregunta lo que quieras',
     desc: 'Selecciona texto y pregunta por voz, con preguntas de seguimiento.',
     shortcutSettings: 'Ajustes de atajos',
     guide: {
@@ -1518,7 +1542,6 @@ export const es: typeof zhCN = {
       microphoneMonitorError: 'No se pudo supervisar el nivel de entrada: {{message}}',
       capsuleLabel: 'Cápsula de grabación',
       capsuleDesc: 'Muestra una cápsula en la parte inferior de la pantalla mientras grabas.',
-      capsuleStyleTypeless: 'Estilo compacto Typeless',
       capsuleTranscriptLabel: 'Mostrar transcripción en directo',
       capsuleTranscriptDesc:
         'Muestra el texto reconocido en lugar de las barras de audio. Sin streaming, aparece al recibir el resultado. Desactiva para restaurar la vista original.',
@@ -1542,9 +1565,69 @@ export const es: typeof zhCN = {
       lowLatencyDictationLabel: 'Captura de baja latencia',
       lowLatencyDictationDesc:
         'Mantén preparado el flujo del micrófono y conserva hasta 500 ms en memoria para reducir la pérdida de voz justo después del atajo. El audio no se guarda ni se sube antes de confirmar la grabación; consume más energía y mantiene activo el indicador del micrófono.',
-      audioEnhancementLabel: 'Mejora ligera del micrófono',
+      dsp: {
+        aec: 'System echo cancellation',
+        systemNoise: 'System noise suppression',
+        systemAgc: 'System automatic gain',
+        unavailable: 'Unavailable on this device',
+        androidEffectsHint:
+          'Android system effects apply before the software chain. Avoid enabling the same effect twice. Unsupported startup falls back to normal capture.',
+        effectsActive: 'System effects are active for this recording.',
+        spectrum: 'Input / processed spectrum',
+        spectrumHint:
+          'Shows the current enhanced recording only. This does not start a microphone, save audio, or upload it. Monitoring stops when this panel closes or goes to the background.',
+        spectrumLegend: 'Gray: input · Color: processed · 20 Hz–24 kHz',
+        spectrumWaiting: 'Start a recording with speech enhancement enabled to see the spectrum.',
+        presets: 'Equalizer presets',
+        choosePreset: 'Choose a preset',
+        preset_normal: 'Flat',
+        preset_brightVocal: 'Bright vocal',
+        preset_deepVoice: 'Deep voice',
+        preset_podcast: 'Podcast',
+        preset_vocalClarity: 'Vocal clarity',
+        preset_warmVocal: 'Warm vocal',
+
+        aecOff: 'Desactivado',
+        aecLight: 'Ligero (poca CPU)',
+        aecModel: 'Modelo (más potente)',
+        aecModelHint:
+          'El modelo cancela más pero cuesta unas 3x más CPU; en equipos antiguos usa Ligero.',
+        aecHint:
+          'Suprime la realimentación del altavoz. Necesita una señal de referencia; con auriculares puedes dejarlo apagado.',
+        buffer: 'Búfer de salida',
+        noise: 'Noise reduction',
+        dereverb: 'Comb filter',
+        equalizer: 'Equalizer',
+        gain: 'Input gain',
+        agc: 'Automatic gain',
+        vad: 'Speech gate',
+        title: 'Speech enhancement settings',
+        description:
+          'RNNoise is lightweight; PureVox offers model-based noise reduction with higher CPU use. Changes apply to the next recording.',
+        off: 'Off',
+        spectral: 'Spectral subtraction',
+        strength: 'Noise reduction strength',
+        target: 'Target level',
+        attack: 'Attack speed',
+        decay: 'Release speed',
+        vadHint:
+          'Attenuates quiet passages; it does not stop recording. A high threshold can remove quiet speech.',
+        threshold: 'Speech gate threshold',
+        tone: 'Tone and room adjustments',
+        combHint:
+          'The comb filter follows MicYou’s simple delay subtraction. It can color speech; start at 0%.',
+        preamp: 'Equalizer preamp',
+        order: 'Processing order',
+        up: 'Move up',
+        down: 'Move down',
+        reset: 'Reset enhancement settings',
+      },
+      echoCancellationLabel: 'Cancelación del eco de reproducción',
+      echoCancellationDesc:
+        'Usa una referencia local sin silenciar la reproducción. En macOS requiere 14.6+ y permiso para grabar audio del sistema. Los dispositivos, rutas Bluetooth o entornos Linux ALSA no compatibles usan solo el micrófono. Se aplica en la próxima captura.',
+      audioEnhancementLabel: 'Mejora de voz',
       audioEnhancementDesc:
-        'Aplica una ganancia ligera, limitación suave y reducción de ruido conservadora al micrófono local. No incluye cancelación de eco. Desactivada de forma predeterminada.',
+        'Reducción de ruido RNNoise o PureVox, ganancia automática y limitación. Desactivada por defecto; los cambios se aplican a la próxima grabación.',
       muteDuringRecordingLabel: 'Silenciar durante la grabación',
       muteDuringRecordingDesc:
         'Silencia temporalmente el sonido del sistema durante la entrada de voz para evitar el eco de los altavoces.',
@@ -1621,6 +1704,10 @@ export const es: typeof zhCN = {
       polishContextWindowLabel: 'Ventana de contexto para mejorar texto (minutos)',
       polishContextWindowDesc:
         'Usa las transcripciones mejoradas de los últimos N minutos como contexto de varias intervenciones. 0 = desactivado.',
+      debugArchiveProcessedLabel: 'Conservar el audio procesado',
+      debugArchiveProcessedDesc: 'La versión tras reducción de ruido y ganancia, en el archivo de grabación existente.',
+      debugArchiveRawLabel: 'Conservar también el audio sin procesar',
+      debugArchiveRawDesc: 'Escribe además <session>.raw.wav junto a él. Si solo activas esto, el audio sin procesar va al archivo principal.',
       recordAudioForDebugLabel: 'Conservar grabación original (depuración)',
       recordAudioForDebugDesc:
         'Guarda el audio original del micrófono en WAV para investigar problemas de reconocimiento.',
@@ -1777,6 +1864,7 @@ export const es: typeof zhCN = {
         openai: 'OpenAI',
         gemini: 'Google Gemini',
         codexOAuth: 'Codex OAuth',
+        chatgptSiwc: 'ChatGPT Plan',
         mimo: 'Xiaomi MiMo',
         cometapi: 'CometAPI',
         openrouterFree: 'OpenRouter (modelos gratuitos)',
@@ -1856,8 +1944,9 @@ export const es: typeof zhCN = {
       volcengineAuthModeApiKey: 'Clave API (consola nueva)',
       volcengineMappingNote:
         'Actualmente no se necesita Secret Key. El Resource ID predeterminado es volc.seedasr.sauc.duration.',
-      volcengineApiKeyNote:
-        'Usa una clave API creada en la nueva consola de voz; no necesitas APP ID. Créala en Gestión de claves API: console.volcengine.com/speech/new/setting/apikeys. El Resource ID predeterminado es volc.seedasr.sauc.duration.',
+      volcengineApiKeyConsole: 'Doubao Speech · Claves API',
+      volcengineApiKeyNote: 'Crea aquí una clave API de voz; las claves de Ark no son válidas.',
+      volcengineResourceIdNote: 'El Resource ID predeterminado es {{resourceId}}.',
       xfyunAppIdLabel: 'AppID',
       xfyunApiKeyLabel: 'Clave API',
       xfyunNote:

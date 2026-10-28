@@ -19,7 +19,6 @@ enum SettingsIcon {
     Settings,
     Mic,
     Sparkle,
-    Monitor,
     Cloud,
     Shield,
     Bolt,
@@ -337,7 +336,6 @@ fn draw_rail_icon(ui: &egui::Ui, center: egui::Pos2, icon: SettingsIcon, color: 
         SettingsIcon::Settings => IconName::Settings,
         SettingsIcon::Mic => IconName::Mic,
         SettingsIcon::Sparkle => IconName::Sparkle,
-        SettingsIcon::Monitor => IconName::Monitor,
         SettingsIcon::Cloud => IconName::Cloud,
         SettingsIcon::Shield => IconName::Shield,
         SettingsIcon::Bolt => IconName::Bolt,
@@ -376,9 +374,6 @@ fn panel(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fronte
             }
             // 实验与扩展的下钻页把标题换成子页标题，并在左侧给出返回箭头
             // （Tauri 的 `activeAdvancedPage` 顶栏）。
-            if vm.advanced_open == 0 && !vm.settings.testing_features {
-                vm.advanced_open = 3;
-            }
             let detail = if vm.settings_section == SettingsSection::Advanced {
                 advanced_page_title(vm, lang)
             } else {
@@ -494,17 +489,9 @@ pub(super) fn save_state(
 /// Title + description of the open 实验与扩展 sub-page (`None` on the list page).
 fn advanced_page_title(vm: &FrontendViewModel, lang: Lang) -> Option<(&'static str, &'static str)> {
     match vm.advanced_open {
-        0 => Some((
-            tr_l10n(lang, "settings.coding_agent.title"),
-            tr_l10n(lang, "modal.advanced_pages.less_computer"),
-        )),
         2 => Some((
             tr_l10n(lang, "settings.debug.title"),
             tr_l10n(lang, "modal.advanced_pages.debug"),
-        )),
-        3 => Some((
-            tr_l10n(lang, "settings.testing_features.title"),
-            tr_l10n(lang, "modal.advanced_pages.testing_features"),
         )),
         _ => None,
     }
@@ -635,6 +622,36 @@ fn general(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fron
                     ));
                 },
             );
+            if super::audio_dsp::settings(
+                ui,
+                &mut vm.settings.audio_dsp,
+                lang,
+                vm.settings.audio_enhancement,
+            ) {
+                actions.push(FrontendAction::SettingsAudioDsp(vm.settings.audio_dsp));
+            }
+            // AEC 需要「扬声器此刻在放什么」：让用户挑回环源（自动 / 不采集 / 具名
+            // 监听设备）。没有回环源时这里只有前两项，AEC 会退化为无参考。
+            if vm.settings.audio_dsp.aec_mode != openless_core::AecMode::Off {
+                let mut options: Vec<&str> = vec![
+                    tr_l10n(lang, "settings.audioDsp.aecReferenceAuto"),
+                    tr_l10n(lang, "settings.audioDsp.aecReferenceOff"),
+                ];
+                options.extend(vm.settings.aec_reference_devices.iter().map(String::as_str));
+                combo_index_row(
+                    ui,
+                    tr_l10n(lang, "settings.audioDsp.aecReferenceLabel"),
+                    tr_l10n(lang, "settings.audioDsp.aecReferenceDesc"),
+                    vm.settings.aec_reference_index.min(options.len().saturating_sub(1)),
+                    &options,
+                    |index| {
+                        actions.push(FrontendAction::SettingsCombo(
+                            SettingsComboField::AecReference,
+                            index,
+                        ));
+                    },
+                );
+            }
             // #4：录音胶囊开关与样式（Tauri `capsuleLabel` / `capsuleStyleLabel`）。
             toggle_row(
                 ui,
@@ -739,6 +756,17 @@ fn general(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fron
                             SettingsActionField::PreviewAudioCue,
                         ));
                     }
+                },
+            );
+            toggle_row(
+                ui,
+                tr_l10n(lang, "settings.recording.echo_cancellation_label"),
+                tr_l10n(lang, "settings.recording.echo_cancellation_desc"),
+                vm.settings.echo_cancellation,
+                || {
+                    actions.push(FrontendAction::SettingsToggle(
+                        SettingsField::EchoCancellation,
+                    ));
                 },
             );
         },
@@ -1090,7 +1118,7 @@ fn shortcuts(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fr
         .unwrap_or_default();
 
     let dictation_hint = recording_mode_hint(lang, vm.settings.recording_mode);
-    let mut rows: Vec<ShortcutRow> = vec![
+    let rows: Vec<ShortcutRow> = vec![
         ShortcutRow {
             field: ShortcutField::Dictation,
             label: tr_l10n(lang, "settings.shortcuts.start_stop"),
@@ -1140,18 +1168,7 @@ fn shortcuts(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fr
             can_disable: true,
             hint: String::new(),
         },
-        ShortcutRow {
-            field: ShortcutField::CodingAgentVoice,
-            label: tr_l10n(lang, "settings.coding_agent.title"),
-            value: vm.coding_agent_hotkey.clone(),
-            can_disable: true,
-            hint: tr_l10n(lang, "settings.coding_agent.voice_hotkey_desc").to_string(),
-        },
     ];
-    // Less Computer 属于 Beta 功能（与 Tauri 的门禁一致）。
-    if !vm.settings.testing_features {
-        rows.retain(|row| row.field != ShortcutField::CodingAgentVoice);
-    }
 
     let trimmed = query.trim().to_lowercase();
     let group_of = |field: ShortcutField| match field {
@@ -1161,7 +1178,7 @@ fn shortcuts(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fr
         | ShortcutField::QuickNote
         | ShortcutField::SelectionPolish => 0,
         ShortcutField::SwitchStyle => 1,
-        ShortcutField::OpenApp | ShortcutField::CodingAgentVoice => 2,
+        ShortcutField::OpenApp => 2,
         ShortcutField::StylePack(_) | ShortcutField::StyleDraft => 1,
     };
     let matches = |label: &str, value: &str| -> bool {
@@ -3063,139 +3080,14 @@ fn advanced(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fro
     // Keep existing drill-in IDs, but the pipeline now lives only on Services.
     let rows = [
         (
-            0,
-            SettingsIcon::Monitor,
-            tr_l10n(lang, "settings.coding_agent.title"),
-            tr_l10n(lang, "modal.advanced_pages.less_computer"),
-        ),
-        (
             2,
             SettingsIcon::Bolt,
             tr_l10n(lang, "settings.debug.title"),
             tr_l10n(lang, "modal.advanced_pages.debug"),
         ),
-        (
-            3,
-            SettingsIcon::Sparkle,
-            tr_l10n(lang, "settings.testing_features.title"),
-            tr_l10n(lang, "modal.advanced_pages.testing_features"),
-        ),
     ];
-    // Beta 开关：Tauri 用 `ExperimentalSectionTitle`（标题 + Beta 徽章）单独成页。
-    if vm.advanced_open == 3 {
-        experimental_card(ui, rows[2].2, "Beta", "", |ui| {
-            toggle_row(
-                ui,
-                tr_l10n(lang, "settings.testing_features.enable"),
-                tr_l10n(lang, "settings.testing_features.description"),
-                vm.settings.testing_features,
-                || {
-                    actions.push(FrontendAction::SettingsToggle(
-                        SettingsField::TestingFeatures,
-                    ))
-                },
-            );
-            if vm.settings.testing_features && drill_row(ui, rows[0].1, rows[0].2, rows[0].3) {
-                vm.advanced_open = 0;
-            }
-        });
-        return;
-    }
-    // 测试功能（Less Computer 等）在 Tauri 里挂在 Beta 页下：开关没开时
-    // 既不在根列表出现，也不能停留在它的详情页。
-    if !vm.settings.testing_features && matches!(vm.advanced_open, 0) {
-        vm.advanced_open = 3;
-        return;
-    }
     if rows.iter().any(|(id, _, _, _)| *id == vm.advanced_open) {
-        card(ui, "", "", |ui| match vm.advanced_open {
-            0 => {
-                toggle_row(
-                    ui,
-                    tr_l10n(lang, "settings.coding_agent.enable"),
-                    tr_l10n(lang, "settings.coding_agent.hotkey_hint"),
-                    vm.settings.less_computer,
-                    || {
-                        actions.push(FrontendAction::SettingsToggle(SettingsField::LessComputer));
-                    },
-                );
-                // Tauri `CodingAgentSection`：后端 / 模型等高级项只在启用后展开。
-                if !vm.settings.less_computer {
-                    return;
-                }
-                combo_index_row(
-                    ui,
-                    tr_l10n(lang, "settings.coding_agent.provider"),
-                    tr_l10n(lang, "settings.coding_agent.coming_soon_note"),
-                    vm.settings.coding_agent_provider.min(3),
-                    &["Claude Code", "OpenCode", "Codex", "dsh"],
-                    |val| {
-                        actions.push(FrontendAction::SettingsCombo(
-                            SettingsComboField::CodingAgentProvider,
-                            val,
-                        ));
-                    },
-                );
-                combo_index_row(
-                    ui,
-                    tr_l10n(lang, "settings.coding_console.permission_mode"),
-                    "",
-                    vm.settings.coding_agent_permission.min(3),
-                    &[
-                        tr_l10n(lang, "settings.coding_console.mode.accept_edits"),
-                        tr_l10n(lang, "settings.coding_console.mode.plan"),
-                        tr_l10n(lang, "settings.coding_console.mode.default"),
-                        tr_l10n(lang, "settings.coding_console.mode.bypass_permissions"),
-                    ],
-                    |val| {
-                        actions.push(FrontendAction::SettingsCombo(
-                            SettingsComboField::CodingAgentPermission,
-                            val,
-                        ));
-                    },
-                );
-                text_edit_row(
-                    ui,
-                    tr_l10n(lang, "settings.coding_agent.model"),
-                    tr_l10n(lang, "settings.coding_agent.model_hint"),
-                    &mut vm.settings.coding_agent_model,
-                    tr_l10n(lang, "settings.coding_agent.model_placeholder"),
-                    |text| {
-                        actions.push(FrontendAction::SettingsText(
-                            SettingsTextField::CodingAgentModel,
-                            text.to_owned(),
-                        ));
-                    },
-                );
-                text_edit_row(
-                    ui,
-                    tr_l10n(lang, "settings.coding_console.workdir"),
-                    tr_l10n(lang, "settings.coding_console.workdir_desc"),
-                    &mut vm.settings.coding_agent_workdir,
-                    tr_l10n(lang, "settings.coding_console.workdir_placeholder"),
-                    |text| {
-                        actions.push(FrontendAction::SettingsText(
-                            SettingsTextField::CodingAgentWorkdir,
-                            text.to_owned(),
-                        ));
-                    },
-                );
-                text_edit_row(
-                    ui,
-                    tr_l10n(lang, "settings.coding_agent.exe"),
-                    "",
-                    &mut vm.settings.coding_agent_exe,
-                    "claude",
-                    |text| {
-                        actions.push(FrontendAction::SettingsText(
-                            SettingsTextField::CodingAgentExe,
-                            text.to_owned(),
-                        ));
-                    },
-                );
-            }
-            1 => {}
-            _ => {
+        card(ui, "", "", |ui| {
                 toggle_row(
                     ui,
                     tr_l10n(lang, "settings.recording.record_audio_for_debug_label"),
@@ -3207,6 +3099,34 @@ fn advanced(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fro
                         ));
                     },
                 );
+                // 调试录音保存哪一份：两个独立开关，可以只留处理前、只留处理后，
+                // 或者两份都留来做 A/B 对照。主开关关掉时这两项无意义。
+                if vm.settings.record_audio_for_debug {
+                    ui.add_enabled_ui(vm.settings.record_audio_for_debug, |ui| {
+                        toggle_row(
+                            ui,
+                            tr_l10n(lang, "settings.recording.archive_processed_label"),
+                            tr_l10n(lang, "settings.recording.archive_processed_desc"),
+                            vm.settings.debug_archive_processed,
+                            || {
+                                actions.push(FrontendAction::SettingsToggle(
+                                    SettingsField::DebugArchiveProcessed,
+                                ));
+                            },
+                        );
+                        toggle_row(
+                            ui,
+                            tr_l10n(lang, "settings.recording.archive_raw_label"),
+                            tr_l10n(lang, "settings.recording.archive_raw_desc"),
+                            vm.settings.debug_archive_raw,
+                            || {
+                                actions.push(FrontendAction::SettingsToggle(
+                                    SettingsField::DebugArchiveRaw,
+                                ));
+                            },
+                        );
+                    });
+                }
                 text_edit_row(
                     ui,
                     tr_l10n(lang, "settings.recording.audio_recording_max_entries_label"),
@@ -3220,6 +3140,19 @@ fn advanced(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fro
                         ));
                     },
                 );
+                combo_index_row(
+                    ui,
+                    tr_l10n(lang, "settings.debug.log_level_label"),
+                    tr_l10n(lang, "settings.debug.log_level_desc"),
+                    vm.settings.log_level.min(2),
+                    &["info", "debug", "trace"],
+                    |index| {
+                        actions.push(FrontendAction::SettingsCombo(
+                            SettingsComboField::LogLevel,
+                            index,
+                        ));
+                    },
+                );
                 action_row(
                     ui,
                     tr_l10n(lang, "settings.debug.title"),
@@ -3228,23 +3161,12 @@ fn advanced(ui: &mut egui::Ui, vm: &mut FrontendViewModel, actions: &mut Vec<Fro
                     SettingsActionField::ExportDiagnostics,
                     actions,
                 );
-            }
         });
         return;
     }
     card(ui, "", "", |ui| {
         for (id, icon, title, description) in &rows {
-            // 测试功能页（Less Computer）只在 Beta 页里列出。
-            if *id == 0 {
-                continue;
-            }
-            // Beta 页在 Tauri 里带徽章，行标题同样标出来。
-            let title = if *id == 3 {
-                format!("{title} · Beta")
-            } else {
-                title.to_string()
-            };
-            if drill_row(ui, *icon, &title, description) {
+            if drill_row(ui, *icon, title, description) {
                 vm.advanced_open = *id;
             }
         }
@@ -4654,6 +4576,10 @@ fn provider_editor_body(
             .color(theme::INK_3),
     );
     ui.add_space(4.0);
+    if editor.auth == SettingsProviderAuth::Siwc {
+        siwc_editor(ui, editor, lang, actions);
+        return;
+    }
     provider_protocol_block(ui, editor, lang, actions);
     ui.label(
         egui::RichText::new(tr_l10n(lang, "providers.credentials"))
@@ -4668,6 +4594,7 @@ fn provider_editor_body(
                     .color(theme::INK_4),
             );
         }
+        SettingsProviderAuth::Siwc => unreachable!("SIWC has its own account form"),
         SettingsProviderAuth::OAuth => {
             ui.label(
                 egui::RichText::new(tr_l10n(lang, "providers.oauth_note"))
@@ -5180,51 +5107,6 @@ fn link_row(
 }
 
 // ── Card & row helpers ──────────────────────────────────────────────────────
-
-/// 实验性功能卡片：标题旁带一枚徽章，悬停给说明（Tauri 的
-/// `ExperimentalSectionTitle`）。多模态管线与 Beta 开关都用它。
-fn experimental_card(
-    ui: &mut egui::Ui,
-    title: &str,
-    badge: &str,
-    hint: &str,
-    contents: impl FnOnce(&mut egui::Ui),
-) {
-    egui::Frame::new()
-        .fill(theme::SURFACE)
-        .stroke(egui::Stroke::new(0.5, theme::LINE))
-        .corner_radius(egui::CornerRadius::same(14))
-        .inner_margin(egui::Margin::symmetric(18, 18))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(title)
-                        .size(13.0)
-                        .strong()
-                        .color(theme::INK),
-                );
-                let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(layout::text_width(ui, badge, 10.0) + 12.0, 16.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(8), theme::BLUE_SOFT);
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    badge,
-                    egui::FontId::proportional(10.0),
-                    theme::BLUE,
-                );
-                if !hint.is_empty() {
-                    let _ = response.on_hover_text(hint);
-                }
-            });
-            ui.add_space(6.0);
-            contents(ui);
-        });
-    ui.add_space(16.0);
-}
 
 /// A settings card. Tauri hides every `SectionDesc` (the only visible
 /// description is the one under the pane title), so the second argument is a
@@ -5888,6 +5770,170 @@ pub(crate) fn test_render_shortcuts(
     shortcuts(ui, vm, actions);
 }
 
+fn siwc_editor(
+    ui: &mut egui::Ui,
+    editor: &SettingsProviderEditor,
+    lang: Lang,
+    actions: &mut Vec<FrontendAction>,
+) {
+    let emit = |actions: &mut Vec<FrontendAction>, action: &str, id: Option<String>| {
+        actions.push(FrontendAction::SettingsSiwc {
+            action: action.into(),
+            registration_id: id,
+        })
+    };
+    ui.label(tr_l10n(lang, "siwc.description"));
+    let Some(state) = editor.siwc.as_ref() else {
+        ui.label(tr_l10n(lang, "common.loading"));
+        if ui.button(tr_l10n(lang, "siwc.refreshModels")).clicked() {
+            emit(actions, "refresh", None);
+        }
+        return;
+    };
+    let status = &state.status;
+    let label = match status.state.as_str() {
+        "connected" => "siwc.states.connected",
+        "authorizing" => "siwc.states.authorizing",
+        "usage_disabled" => "siwc.states.usage_disabled",
+        "usage_limited" => "siwc.states.usage_limited",
+        "reauthorization_required" => "siwc.states.reauthorization_required",
+        _ => "siwc.states.signed_out",
+    };
+    ui.strong(tr_l10n(lang, label));
+    egui::ComboBox::from_id_salt(("siwc-account", &editor.channel_id))
+        .selected_text(
+            status
+                .account
+                .as_ref()
+                .map(|a| a.label.as_str())
+                .unwrap_or(tr_l10n(lang, "siwc.account")),
+        )
+        .show_ui(ui, |ui| {
+            for account in &status.accounts {
+                if ui
+                    .selectable_label(
+                        status.account.as_ref().is_some_and(|a| a.id == account.id),
+                        &account.label,
+                    )
+                    .clicked()
+                {
+                    emit(actions, "select", Some(account.id.clone()));
+                }
+            }
+        });
+    ui.horizontal_wrapped(|ui| {
+        if status.state == "authorizing" {
+            if ui.button(tr_l10n(lang, "siwc.cancel")).clicked() {
+                emit(actions, "cancel", None);
+            }
+        } else {
+            let (action, label) = if status.state == "usage_disabled" {
+                ("enable_usage", tr_l10n(lang, "siwc.enableUsage"))
+            } else if status.account.is_some() {
+                ("sign_in", tr_l10n(lang, "siwc.reauthorize"))
+            } else {
+                ("sign_in", "Continue with ChatGPT")
+            };
+            if ui.button(label).clicked() {
+                emit(actions, action, None);
+            }
+            if !status.accounts.is_empty() && ui.button(tr_l10n(lang, "siwc.addAccount")).clicked()
+            {
+                emit(actions, "add_account", None);
+            }
+            if status.account.is_some() && ui.button(tr_l10n(lang, "siwc.disconnect")).clicked() {
+                emit(actions, "disconnect", None);
+            }
+        }
+        if provider_small_button(
+            ui,
+            lang,
+            "siwc.manageUsage",
+            status.state == "usage_limited",
+        ) {
+            ui.ctx()
+                .open_url(egui::OpenUrl::new_tab(openless_core::siwc::USAGE_URL));
+        }
+        if status.state == "usage_limited" && ui.button(tr_l10n(lang, "siwc.retry")).clicked() {
+            emit(actions, "retry", None);
+        }
+    });
+    if let Some(error) = &status.error {
+        if error.code == "remote_revocation_unconfirmed" {
+            ui.label(tr_l10n(lang, "siwc.remoteUnconfirmed"));
+        } else {
+            ui.colored_label(
+                theme::INK_3,
+                format!("{} ({})", tr_l10n(lang, "siwc.failed"), error.code),
+            );
+        }
+    }
+    if let Some(message) = &state.message {
+        if message != "siwc.remoteUnconfirmed"
+            || !status
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == "remote_revocation_unconfirmed")
+        {
+            ui.label(match message.as_str() {
+                "siwc.remoteUnconfirmed" => tr_l10n(lang, "siwc.remoteUnconfirmed"),
+                "siwc.testSuccess" => tr_l10n(lang, "siwc.testSuccess"),
+                _ => message,
+            });
+        }
+    }
+    if status.welcome_pending {
+        ui.group(|ui| {
+            ui.strong(tr_l10n(lang, "siwc.welcome"));
+            if ui.button(tr_l10n(lang, "siwc.gotIt")).clicked() {
+                emit(actions, "acknowledge", None);
+            }
+        });
+    }
+    if status.state == "connected" {
+        let selected = state.models.iter().find(|m| m.slug == editor.model);
+        if !editor.model.is_empty() && selected.is_none() {
+            ui.label(fmt_l10n(lang, "siwc.modelUnavailable", &[&editor.model]));
+        }
+        if state.models.is_empty() {
+            ui.label(tr_l10n(lang, "siwc.noModels"));
+        }
+        egui::ComboBox::from_id_salt(("siwc-model", &editor.channel_id))
+            .selected_text(
+                selected
+                    .map(|m| m.display_name.as_str())
+                    .unwrap_or(tr_l10n(lang, "siwc.selectModel")),
+            )
+            .show_ui(ui, |ui| {
+                for model in &state.models {
+                    if ui
+                        .selectable_label(editor.model == model.slug, &model.display_name)
+                        .clicked()
+                    {
+                        actions.push(FrontendAction::SettingsProviderModelSelected(
+                            model.slug.clone(),
+                        ));
+                    }
+                }
+            });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(tr_l10n(lang, "siwc.refreshModels")).clicked() {
+                emit(actions, "refresh", None);
+            }
+            if ui
+                .add_enabled(
+                    selected.is_some(),
+                    egui::Button::new(tr_l10n(lang, "siwc.test")),
+                )
+                .clicked()
+            {
+                emit(actions, "test", None);
+            }
+        });
+        ui.label(tr_l10n(lang, "siwc.testHint"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// 点「验证」后按钮要立刻变成「正在验证…」并禁用，直到结果回包或超时。
@@ -6406,6 +6452,7 @@ mod tests {
         let shapes = [
             SettingsProviderAuth::None,
             SettingsProviderAuth::OAuth,
+            SettingsProviderAuth::Siwc,
             SettingsProviderAuth::Volcengine,
             SettingsProviderAuth::Xfyun,
             SettingsProviderAuth::Other,
@@ -6413,6 +6460,7 @@ mod tests {
         ];
         for auth in shapes {
             let editor = SettingsProviderEditor {
+                siwc: None,
                 channel_id: "channel".to_string(),
                 is_asr: false,
                 is_draft: false,
@@ -6445,7 +6493,7 @@ mod tests {
             });
             assert!(
                 actions.is_empty(),
-                "渲染 {auth:?} 形态的编辑器时不应产生动作"
+                "rendering the {auth:?} editor must not emit actions"
             );
         }
     }
@@ -6456,6 +6504,7 @@ mod tests {
     fn provider_model_block_follows_the_descriptor() {
         let editor = |static_models: Vec<String>, has_models_url: bool, custom_model: bool| {
             SettingsProviderEditor {
+                siwc: None,
                 channel_id: "channel".to_string(),
                 is_asr: false,
                 is_draft: false,
@@ -6592,6 +6641,7 @@ mod tests {
         let vm = crate::ui::frontend::FrontendViewModel {
             lang: Lang::ZhCn,
             provider_editor: Some(SettingsProviderEditor {
+                siwc: None,
                 channel_id: "channel".to_string(),
                 is_asr: false,
                 is_draft: false,
@@ -6673,7 +6723,7 @@ mod tests {
         // 右栏覆盖不该出现设置页自己的标题（编辑器整栏盖住内容区）。
         let section_title = tr_l10n(Lang::ZhCn, "modal.service_views.llm");
         assert!(
-            !painted(&format!("{section_title}服务")),
+            !painted(section_title),
             "the settings section body must not show through the editor"
         );
 

@@ -1,3 +1,4 @@
+mod audio_dsp;
 pub mod capsule_motion;
 pub mod cloud_sync;
 pub mod corrections;
@@ -735,6 +736,7 @@ mod tests {
             settings_section: super::view_model::SettingsSection::Services,
             services_view: 1,
             provider_editor: Some(super::view_model::SettingsProviderEditor {
+                siwc: None,
                 channel_id: "channel".to_string(),
                 is_asr: false,
                 is_draft: true,
@@ -823,6 +825,7 @@ mod tests {
         let zh = openless_linux_egui::Lang::ZhCn;
         let editor = || {
             Some(super::view_model::SettingsProviderEditor {
+                siwc: None,
                 channel_id: "channel".to_string(),
                 is_asr: false,
                 is_draft: false,
@@ -922,70 +925,6 @@ mod tests {
             rect.height() > 0.0 && rect.bottom() <= small.bottom(),
             "the settings row must be visible inside the window: {rect:?}"
         );
-    }
-
-    #[test]
-    fn less_computer_rows_follow_the_enable_toggle() {
-        // Tauri `CodingAgentSection` shows 后端/权限/模型等配置行 only while the
-        // feature is enabled; a disabled section is just the toggle.
-        let ctx = egui::Context::default();
-        let zh = openless_linux_egui::Lang::ZhCn;
-        let provider = openless_linux_egui::tr_l10n(zh, "settings.coding_agent.provider");
-        for (enabled, expected) in [(false, false), (true, true)] {
-            let mut vm = FrontendViewModel {
-                lang: zh,
-                active_page: Page::Settings,
-                settings_open: true,
-                settings_section: super::view_model::SettingsSection::Advanced,
-                advanced_open: 0,
-                ..Default::default()
-            };
-            vm.settings.less_computer = enabled;
-            vm.settings.testing_features = true;
-            let mut painted = String::new();
-            for _ in 0..2 {
-                ctx.begin_pass(egui::RawInput {
-                    screen_rect: Some(viewport()),
-                    ..Default::default()
-                });
-                let mut actions = Vec::new();
-                render(&ctx, &mut vm, &mut actions);
-                painted = painted_text(&crate::ui::frontend::end_pass(&ctx));
-            }
-            assert_eq!(
-                painted.lines().any(|line| line.trim() == provider),
-                expected,
-                "Less Computer config rows must follow the enable toggle"
-            );
-        }
-    }
-
-    #[test]
-    fn testing_features_hide_root_entries_and_revoke_an_open_detail_page() {
-        use super::view_model::SettingsSection;
-        let mut vm = FrontendViewModel::default();
-        let root = painted_settings_lines(SettingsSection::Advanced, &mut vm);
-        let title = openless_linux_egui::tr_l10n(
-            openless_linux_egui::Lang::ZhCn,
-            "settings.testing_features.title",
-        );
-        assert!(root.iter().any(|line| line.contains(title)));
-        assert!(!root.iter().any(|line| line == "Less Computer"));
-        vm.advanced_open = 3;
-        let off = painted_settings_lines(SettingsSection::Advanced, &mut vm);
-        assert!(!off.iter().any(|line| line == "Less Computer"));
-        vm.settings.testing_features = true;
-        let on = painted_settings_lines(SettingsSection::Advanced, &mut vm);
-        assert!(on.iter().any(|line| line == "Less Computer"));
-        vm.advanced_open = 0;
-        vm.settings.less_computer = true;
-        vm.settings.testing_features = false;
-        let revoked = painted_settings_lines(SettingsSection::Advanced, &mut vm);
-        assert_eq!(vm.advanced_open, 3);
-        assert!(!revoked.iter().any(|line| line == "Less Computer"));
-        let shortcuts = painted_settings_lines(SettingsSection::Shortcuts, &mut vm);
-        let agent_voice = openless_linux_egui::tr_l10n(vm.lang, "settings.shortcuts.agent_voice");
-        assert!(!shortcuts.iter().any(|line| line == agent_voice));
     }
 
     /// Render two frames so layout and text are settled.
@@ -1378,6 +1317,7 @@ mod tests {
         };
         let editor = |channel_id: &str, endpoint: &str, model: &str| {
             super::view_model::SettingsProviderEditor {
+                siwc: None,
                 channel_id: channel_id.to_string(),
                 is_asr: false,
                 is_draft: false,
@@ -1737,10 +1677,9 @@ mod tests {
             active_page: Page::Settings,
             settings_open: true,
             settings_section: super::view_model::SettingsSection::Shortcuts,
-            shortcut_recording: Some(ShortcutField::CodingAgentVoice),
+            shortcut_recording: Some(ShortcutField::OpenApp),
             ..Default::default()
         };
-        vm.settings.testing_features = true;
         let held = egui::Modifiers {
             ctrl: true,
             command: true,
@@ -1763,7 +1702,7 @@ mod tests {
             }
         }
         assert_eq!(captured.len(), 1, "exactly one capture after the release");
-        assert_eq!(captured[0].0, ShortcutField::CodingAgentVoice);
+        assert_eq!(captured[0].0, ShortcutField::OpenApp);
         assert_eq!(captured[0].1, "LeftControl");
         assert!(captured[0].2.is_empty(), "a bare modifier carries no tags");
     }
